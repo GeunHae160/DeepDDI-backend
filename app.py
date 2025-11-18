@@ -1,227 +1,240 @@
 import streamlit as st
 import pandas as pd
 import re
-import sqlite3
-import gdown  # 구글 드라이브 다운로드용
-import os     # 파일이 존재하는지 확인용
+import os
+from itertools import combinations # [필수] 다중 분석을 위한 도구
 
-# 1. 데이터 로드 (DB 다운로드 및 연결)
-@st.cache_resource  # DB 연결은 @st.cache_resource 사용
+# --- 1. 데이터 로드 (CSV 직접 읽기) ---
+@st.cache_data
 def load_data():
-    """druglist.db 파일을 다운로드하고 연결합니다."""
+    """CSV 파일을 읽고 검색 속도를 위해 최적화합니다."""
+    file_path = 'druglist.csv'
     
-    DB_FILE = 'druglist.db'
-    GDRIVE_FILE_ID = '11B6_WtJWs5AIfCAbN67F2sqaAkWCyJob' 
-    
+    if not os.path.exists(file_path):
+        st.error(f"❌ '{file_path}' 파일이 없습니다. 같은 폴더에 넣어주세요.")
+        return None
+        
     try:
-        if not os.path.exists(DB_FILE):
-            st.info(f"'{DB_FILE}' 파일이 없어 Google Drive에서 다운로드합니다... (시간이 걸릴 수 있습니다)")
-            # fuzzy=True 옵션으로 대용량 파일 경고 무시
-            gdown.download(id=GDRIVE_FILE_ID, output=DB_FILE, quiet=False, fuzzy=True)
-            st.info("데이터베이스 다운로드 완료!")
-
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        # CSV 읽기 (UTF-8)
+        df = pd.read_csv(file_path, encoding='utf-8', dtype=str)
+        df['상세정보'] = df['상세정보'].fillna('상호작용 정보 없음')
         
-        def normalize_text(text):
-            if text is None: return None
-            return re.sub(r'[\s\(\)\[\]_/-]|주사제|정제|정|약|캡슐|시럽', '', str(text)).strip().lower()
-        conn.create_function("normalize", 1, normalize_text)
-        
-        print("✅ (Streamlit) 약물 데이터베이스 로드 성공!")
-        return conn
-        
+        # [속도 향상] 검색용 'clean' 컬럼 미리 생성
+        clean_rule = r'[\s\(\)\[\]_/\-\.]|주사제|정제|정|약|캡슐|시럽|약물'
+        for col in ['제품명A', '성분명A', '제품명B', '성분명B']:
+            df[col + '_clean'] = df[col].astype(str).str.lower().str.replace(clean_rule, '', regex=True)
+            
+        print("✅ CSV 데이터 로드 완료!")
+        return df
     except Exception as e:
-        st.error(f"❌ 데이터베이스 로드 실패: {e}")
-        st.error("Google Drive 링크가 '링크가 있는 모든 사용자'로 공유되었는지 다시 확인해주세요.")
+        st.error(f"파일 로드 실패: {e}")
         return None
 
-# 데이터베이스 연결 실행
-conn = load_data()
+df = load_data()
 
-# 2. 약물 검색 및 상호작용 함수들
-def find_drug_info(db_conn, query):
-    """SQL을 사용해 DB에서 유연하게 검색합니다."""
-    
-    cleaned_query = re.sub(r'[\s\(\)\[\]_/-]|주사제|정제|정|약|캡슐|시럽', '', query).strip().lower()
-    
-    if len(cleaned_query) < 2:
-        return pd.DataFrame() 
-    
-    try:
-        search_pattern = f"%{cleaned_query}%"
-        sql_query = """
-        SELECT DISTINCT 제품명A, 성분명A, 제품명B, 성분명B 
-        FROM druglist 
-        WHERE normalize(제품명A) LIKE ? OR normalize(성분명A) LIKE ? OR normalize(제품명B) LIKE ? OR normalize(성분명B) LIKE ?
-        """
-        search_results = pd.read_sql(sql_query, db_conn, params=(search_pattern, search_pattern, search_pattern, search_pattern))
-        
-        return search_results
+# --- 2. 핵심 기능 함수들 (Pandas 버전) ---
 
-    except Exception as e:
-        print(f"DEBUG: find_drug_info (SQL)에서 오류 발생 - {e}")
-        return pd.DataFrame()
+def search_products(df, query):
+    """약물 이름으로 '제품명' 리스트를 검색합니다."""
+    clean_rule = r'[\s\(\)\[\]_/\-\.]|주사제|정제|정|약|캡슐|시럽|약물'
+    clean_q = re.sub(clean_rule, '', query).strip().lower()
     
-
-def check_drug_interaction_flexible(db_conn, drug_A_query, drug_B_query):
-    """ 괄호/공백 무시 + 부분 검색 + 모호성 감지 로직 (SQL 버전) """
-    
-    cleaned_A = re.sub(r'[\s\(\)\[\]_/-]|주사제|정제|정|약|캡슐|시럽', '', drug_A_query).strip().lower()
-    cleaned_B = re.sub(r'[\s\(\)\[\]_/-]|주사제|정제|정|약|캡슐|시럽', '', drug_B_query).strip().lower()
-
-    if len(cleaned_A) < 2 or len(cleaned_B) < 2:
-        return "정보 없음", "약물 이름이 너무 짧습니다. (2글자 이상 입력)"
-
-    pattern_A = f"%{cleaned_A}%"
-    pattern_B = f"%{cleaned_B}%"
+    if len(clean_q) < 2: return []
 
     try:
-        query_a_cols = "(normalize(제품명A) LIKE ? OR normalize(성분명A) LIKE ?)"
-        query_b_cols = "(normalize(제품명B) LIKE ? OR normalize(성분명B) LIKE ?)"
+        pattern = re.escape(clean_q)
+        # clean 컬럼에서 검색
+        mask = df['제품명A_clean'].str.contains(pattern) | df['제품명B_clean'].str.contains(pattern)
         
-        sql_query = f"""
-        SELECT DISTINCT 제품명A, 제품명B, 상세정보 
-        FROM druglist 
-        WHERE 
-            ({query_a_cols} AND {query_b_cols}) 
-            OR 
-            ({query_b_cols.replace('B', 'A')} AND {query_a_cols.replace('A', 'B')})
-        """
+        # 검색된 행에서 제품명 추출
+        res_a = df.loc[df['제품명A_clean'].str.contains(pattern), '제품명A']
+        res_b = df.loc[df['제품명B_clean'].str.contains(pattern), '제품명B']
         
-        interactions = pd.read_sql(sql_query, db_conn, params=(
-            pattern_A, pattern_A, pattern_B, pattern_B,
-            pattern_B, pattern_B, pattern_A, pattern_A
-        ))
+        # 합치고 정렬
+        candidates = sorted(list(set(res_a).union(set(res_b))))
+        return candidates
+    except:
+        return []
 
-    except Exception as e:
-        print(f"DEBUG: check_drug_interaction (SQL)에서 오류 발생 - {e}")
-        return "오류", "데이터베이스 검색 중 오류가 발생했습니다."
-
-    if interactions.empty:
-        return "안전", f"'{drug_A_query}'와 '{drug_B_query}' 간의 상호작용 정보가 없습니다."
-
-    unique_products = set(interactions['제품명A']).union(set(interactions['제품명B']))
-    
-    if len(unique_products) > 2:
-        risk_level = "정보 확인" 
-        warning_msg = f"🔍 **검색 결과가 너무 많습니다.**\n\n'{drug_A_query}' 또는 '{drug_B_query}'에 해당하는 제품/용량이 여러 개 있습니다. 약물 이름을 더 정확하게 입력해주세요.\n(예: '구주염산페치딘주 50mg')"
-        return risk_level, warning_msg
-
-    interactions = interactions.drop_duplicates(subset=['상세정보'])
-    
-    dangerous_keywords = ["사망", "흥분", "정신착란", "금기", "투여 금지", "독성 증가", "치명적인", "심각한", "유산 산성증", "고칼륨혈증", "심실성 부정맥", "위험성 증가", "위험 증가", "심장 부정맥", "QT간격 연장 위험 증가", "QT연장", "심부정맥", "중대한", "심장 모니터링", "병용금기", "Torsade de pointes 위험 증가", "위험이 증가함", "약물이상반응 발생 위험", "독성", "허혈", "혈관경련", ]
-    caution_keywords = ["치료 효과가 제한적", "중증의 위장관계 이상반응", "Alfuzosin 혈중농도 증가", "양쪽 약물 모두 혈장농도 상승 가능", "Amiodarone 혈중농도 증가", "혈중농도 증가", "횡문근융해와 같은 중증의 근육이상 보고",  "혈장 농도 증가", "Finerenone 혈중농도의 현저한 증가가 예상됨"]
-    
-    risk_level, reasons, processed_details = "안전", [], set() 
-    for detail in interactions['상세정보'].unique():
-        if detail in processed_details: continue
-        detail_str = str(detail)
-        processed_details.add(detail)
-        found_danger = False
-        for keyword in dangerous_keywords:
-            if keyword in detail_str:
-                risk_level = "위험" 
-                reasons.append(f"🚨 **위험**: {detail_str}")
-                found_danger = True
-                break 
-        if not found_danger:
-            for keyword in caution_keywords:
-                if keyword in detail_str:
-                    if risk_level != "위험": risk_level = "주의"
-                    reasons.append(f"⚠️ **주의**: {detail_str}")
-                    break 
-    if not reasons:
-        risk_level = "정보 확인"
-        reasons.append("ℹ️ 상호작용 정보가 있으나, 지정된 위험/주의 키워드는 발견되지 않았습니다. 전문가와 상담하세요.")
-    
-    return risk_level, "\n\n".join(reasons)
-
-# 3. Streamlit 웹사이트 UI 코드
-st.title("💊 약물 상호작용 챗봇")
-st.caption("캡스톤 프로젝트: 약물 상호작용 정보 검색 챗봇")
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if not st.session_state.messages:
-    st.session_state.messages.append(
-        {"role": "assistant", "content": "안녕하세요! 약물 상호작용 챗봇입니다.\n\n[질문 예시]\n1. 타이레놀 성분이 뭐야?\n2. 타이레놀과 아스피린을 같이 복용해도 돼?"}
-    )
-
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if conn is None:
-    st.error("데이터베이스 연결 실패로 챗봇을 실행할 수 없습니다.")
-else:
-    if prompt := st.chat_input("질문을 입력하세요... (예: 타이레놀과 아스피린)"):
+def get_ingredients(df, exact_product_name):
+    """확정된 제품명의 성분을 가져옵니다."""
+    try:
+        mask = (df['제품명A'] == exact_product_name) | (df['제품명B'] == exact_product_name)
+        rows = df[mask]
         
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        reply_message = ""
-        
-        # 성분 질문
-        match_component = re.match(r'(.+?)\s*성분[이]?[ ]?(뭐야|알려줘)\??', prompt.strip())
-        if match_component:
-            drug_name = match_component.group(1).strip('() ')
-            if drug_name:
-                results = find_drug_info(conn, drug_name)
-                if not results.empty:
-                    components = set()
-                    # [수정됨] 사용자가 입력한 약물 이름이 있는 컬럼의 성분만 가져오는 로직
-                    target_pattern = re.escape(re.sub(r'[\s\(\)\[\]_/-]|주사제|정제|정|약|캡슐|시럽', '', drug_name).strip().lower())
-                    
-                    for _, row in results.iterrows():
-                        # 제품명A_clean을 정규식으로 청소해서 비교 (DB에 저장된게 없으니 즉석에서)
-                        prod_A_clean = re.sub(r'[\s\(\)\[\]_/-]|주사제|정제|정|약|캡슐|시럽', '', str(row['제품명A'])).strip().lower()
-                        prod_B_clean = re.sub(r'[\s\(\)\[\]_/-]|주사제|정제|정|약|캡슐|시럽', '', str(row['제품명B'])).strip().lower()
-                        
-                        if target_pattern in prod_A_clean:
-                            if pd.notna(row['성분명A']): components.add(row['성분명A'])
-                        
-                        if target_pattern in prod_B_clean:
-                            if pd.notna(row['성분명B']): components.add(row['성분명B'])
-
-                    components = {str(d) for d in components if pd.notna(d) and len(str(d)) > 1 and str(d) != 'nan'}
-                    
-                    if components:
-                        reply_message = f"✅ '{drug_name}'의 관련 성분은 다음과 같습니다:\n\n* {', '.join(components)}"
-                    else:
-                        reply_message = f"ℹ️ '{drug_name}'을(를) 찾았으나, 연관된 성분 정보를 추출하지 못했습니다."
-                else:
-                    reply_message = f"ℹ️ '{drug_name}'에 대한 정보를 상호작용 데이터베이스에서 찾을 수 없습니다."
-            else:
-                reply_message = "❌ 어떤 약물의 성분을 알고 싶으신가요? 약물 이름을 입력해주세요."
-        
-        # 상호작용 질문
-        match_interaction = re.match(r'(.+?)\s*(?:이랑|랑|과|와|하고)\s+(.+?)(?:를|을)?\s+(?:같이|함께)\s+(?:복용해도|먹어도)\s+(?:돼|되나|될까|되나요)\??', prompt.strip())
-        
-        if not match_interaction:
-             match_interaction_simple = re.match(r'^\s*([^\s]+)\s+([^\s]+)\s*$', prompt.strip())
-             if match_interaction_simple:
-                 match_interaction = match_interaction_simple
-
-        if match_interaction and not reply_message:
-            drug_A_query = match_interaction.group(1).strip('() ')
-            drug_B_query = match_interaction.group(2).strip('() ')
+        ingredients = set()
+        for _, r in rows.iterrows():
+            if r['제품명A'] == exact_product_name: ingredients.add(r['성분명A'])
+            if r['제품명B'] == exact_product_name: ingredients.add(r['성분명B'])
             
-            if drug_A_query and drug_B_query:
-                with st.spinner(f"🔄 '{drug_A_query}'와 '{drug_B_query}' 상호작용 검색 중..."):
-                    risk, explanation = check_drug_interaction_flexible(conn, drug_A_query, drug_B_query)
-                
-                if risk == "정보 없음":
-                    reply_message = f"**💊 약물 상호작용 위험도: 정보 없음**\n\n**💡 상세 정보:**\n\n{explanation}"
-                else:
-                    reply_message = f"**💊 약물 상호작용 위험도: {risk}**\n\n**💡 상세 정보:**\n\n{explanation}"
-            else:
-                reply_message = "❌ 두 약물 이름을 정확히 입력해주세요. 예: (A)약물과 (B)약물을 같이 복용해도 돼?"
-        
-        elif not match_component and not match_interaction:
-            reply_message = "🤔 죄송합니다. 질문 형식을 이해하지 못했습니다.\n\n  **[질문 예시]**\n  * 타이레놀과 아스피린\n  * 타이레놀 성분이 뭐야?"
+        return {x for x in ingredients if pd.notna(x) and x != 'nan'}
+    except:
+        return set()
 
-        st.session_state.messages.append({"role": "assistant", "content": reply_message})
-        with st.chat_message("assistant"):
-            st.markdown(reply_message)
+def check_interaction(df, prod_A, prod_B):
+    """확정된 두 제품 간의 상호작용을 확인합니다."""
+    try:
+        # 정확한 이름으로 매칭
+        mask = ((df['제품명A'] == prod_A) & (df['제품명B'] == prod_B)) | \
+               ((df['제품명A'] == prod_B) & (df['제품명B'] == prod_A))
+        
+        interactions = df[mask]
+        
+        if interactions.empty:
+            return "안전", f"'{prod_A}'와 '{prod_B}' 간의 보고된 상호작용 정보가 없습니다."
+        
+        # 위험도 분석
+        details = interactions['상세정보'].unique()
+        danger = ["사망", "흥분", "정신착란", "금기", "투여 금지", "독성", "심각한", "부정맥", "위험 증가", "병용금기", "쇼크", "발작"]
+        caution = ["주의", "상승 가능", "증가", "감소", "제한적", "조절", "신중"]
+        
+        risk, msgs = "안전", []
+        for d in details:
+            d_str = str(d)
+            found = False
+            for k in danger:
+                if k in d_str:
+                    risk = "위험"; msgs.append(f"🚨 **위험**: {d_str}"); found=True; break
+            if not found:
+                for k in caution:
+                    if k in d_str:
+                        if risk!="위험": risk="주의"
+                        msgs.append(f"⚠️ **주의**: {d_str}"); break
+        
+        if not msgs:
+            risk = "정보 확인"
+            msgs.append(f"ℹ️ **정보**: {details[0]}")
+            
+        return risk, "\n".join(msgs)
+    except:
+        return "오류", "분석 중 오류 발생"
+
+
+# --- 3. UI 및 상태 관리 ---
+
+st.title("💊 약물 상호작용 챗봇")
+
+# 세션 상태 초기화
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "기능을 선택해주세요."}]
+if "mode" not in st.session_state: st.session_state.mode = None
+if "queue" not in st.session_state: st.session_state.queue = []       
+if "resolved" not in st.session_state: st.session_state.resolved = [] 
+if "selecting" not in st.session_state: st.session_state.selecting = False 
+if "options" not in st.session_state: st.session_state.options = []
+
+# 상단 버튼
+c1, c2 = st.columns(2)
+if c1.button("💊 성분 검색", use_container_width=True):
+    st.session_state.mode = "ing"
+    st.session_state.messages = [{"role": "assistant", "content": "💊 **성분 검색** 모드입니다. 약물 이름을 입력하세요."}]
+    st.session_state.selecting = False
+    st.session_state.resolved = [] # 초기화
+    st.rerun()
+
+if c2.button("⚠️ 상호작용 분석", use_container_width=True):
+    st.session_state.mode = "int"
+    st.session_state.messages = [{"role": "assistant", "content": "⚠️ **상호작용 분석** 모드입니다. 약물들을 입력해주세요.\n(예: 네시나, 보노렉스, 타이레놀)"}]
+    st.session_state.selecting = False
+    st.session_state.resolved = [] # 초기화
+    st.rerun()
+
+# 대화 기록 표시
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+# --- 4. 선택지 처리 (사용자 입력 대기) ---
+if st.session_state.selecting:
+    target = st.session_state.queue[0]
+    st.info(f"👇 **'{target}'** 제품을 선택해주세요:")
+    
+    cols = st.columns(min(len(st.session_state.options), 3))
+    for i, opt in enumerate(st.session_state.options):
+        if st.button(opt, key=f"sel_{i}"):
+            st.session_state.messages.append({"role": "user", "content": f"✅ {opt} 선택"})
+            st.session_state.resolved.append(opt)
+            st.session_state.queue.pop(0)
+            st.session_state.selecting = False
+            st.rerun()
+
+# --- 5. 메인 로직 (자동 처리 Loop) ---
+# 선택 모드가 아닐 때만 실행
+if not st.session_state.selecting:
+    
+    # (A) 대기열 처리 (검색 -> 1개면 자동확정, 여러개면 선택모드)
+    if st.session_state.queue:
+        curr = st.session_state.queue[0]
+        cands = search_products(df, curr) # [변경] conn 대신 df 전달
+        
+        if len(cands) > 1:
+            st.session_state.options = cands
+            st.session_state.selecting = True
+            st.rerun()
+        elif len(cands) == 1:
+            # 1개면 사용자에게 묻지 않고 조용히 확정 후 계속 진행
+            st.session_state.resolved.append(cands[0])
+            st.session_state.queue.pop(0)
+            st.rerun()
+        else:
+            st.session_state.messages.append({"role": "assistant", "content": f"❌ '{curr}' 정보를 찾을 수 없어 제외합니다."})
+            st.session_state.queue.pop(0)
+            st.rerun()
+
+    # (B) 대기열이 비었고, 확정된 약물이 있다면 -> 결과 출력
+    elif st.session_state.resolved:
+        final_drugs = st.session_state.resolved
+        
+        # 1. 성분 검색 결과
+        if st.session_state.mode == "ing":
+            for drug in final_drugs:
+                ings = get_ingredients(df, drug) # [변경] conn 대신 df 전달
+                msg = f"✅ **'{drug}'** 성분: {', '.join(ings)}" if ings else f"ℹ️ '{drug}' 성분 정보 없음"
+                st.session_state.messages.append({"role": "assistant", "content": msg})
+        
+        # 2. 상호작용 분석 결과 (다중 분석 지원)
+        elif st.session_state.mode == "int":
+            if len(final_drugs) < 2:
+                st.session_state.messages.append({"role": "assistant", "content": "❌ 비교할 약물이 부족합니다. (최소 2개 입력)"})
+            else:
+                # [핵심] N:N 분석 로직 추가
+                report = []
+                found_risk = False
+                
+                with st.spinner(f"🔄 {len(final_drugs)}개 약물의 모든 조합을 분석 중..."):
+                    # combinations를 사용해 모든 짝꿍(2개 조합)을 검사
+                    for a, b in combinations(final_drugs, 2):
+                        risk, exp = check_interaction(df, a, b) # [변경] conn 대신 df 전달
+                        
+                        if risk != "안전":
+                            report.append(f"**[{a} ↔ {b}] {risk}**\n{exp}")
+                            found_risk = True
+                        # 안전한 경우는 리포트에 포함하지 않음 (너무 길어짐 방지)
+
+                if found_risk:
+                    final_msg = "### ⚠️ 분석 결과\n\n" + "\n\n---\n\n".join(report)
+                else:
+                    final_msg = f"✅ 선택하신 {len(final_drugs)}개 약물 간에 발견된 위험 상호작용이 없습니다."
+                
+                st.session_state.messages.append({"role": "assistant", "content": final_msg})
+        
+        st.session_state.resolved = [] # 결과 출력 후 초기화
+        st.rerun()
+
+    # (C) 아무 작업 없을 때 입력창 표시
+    elif st.session_state.mode:
+        placeholder = "약물 이름 입력..." if st.session_state.mode == "ing" else "약물들 입력 (예: A, B, C)"
+        if prompt := st.chat_input(placeholder):
+            if df is None: st.error("파일 로드 안됨"); st.stop()
+            
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"): st.markdown(prompt)
+            
+            parts = re.split(r'[,\s]+|과|와|랑|하고', prompt)
+            parts = [p.strip() for p in parts if p.strip()]
+            
+            if parts:
+                st.session_state.queue = parts
+                st.session_state.resolved = []
+                st.rerun()
+            else:
+                 st.warning("입력해주세요.")
